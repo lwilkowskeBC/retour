@@ -87,14 +87,19 @@ class RetourService extends BaseApplicationComponent
     {
         $result = null;
 
-        // Check the cache first
-        $redirect = $this->getRedirectFromCache($url);
-        if ($redirect) {
-            $error = $this->incrementRedirectHitCount($redirect);
-            $this->saveRedirectToCache($url, $redirect);
-            RetourPlugin::log("[cached] " . $redirect['redirectMatchType'] . " result: " . print_r($error, true), LogLevel::Info, false);
+        $urlLocale = $url . $this->getLocale();
+        $urlAll = $url . "all";
 
-            return $redirect;
+        foreach ([$urlLocale, $urlAll, $url] as $url) {
+            $redirect = $this->getRedirectFromCache($url);
+            if ($redirect) {
+                $error = $this->incrementRedirectHitCount($redirect);
+                $this->saveRedirectToCache($url, $redirect);
+                RetourPlugin::log("[cached] " . $redirect['redirectMatchType'] . " result: " . print_r($error, true),
+                    LogLevel::Info, false);
+
+                return $redirect;
+            }
         }
 
         // Look up the entry redirects first
@@ -108,12 +113,54 @@ class RetourService extends BaseApplicationComponent
         // Look up the static redirects next
         $redirects = null;
         $redirects = $this->getAllStaticRedirects();
-        $result = $this->lookupRedirect($url, $redirects);
+        $result = $this->lookupRedirect($url, $redirects, true);
+
         if ($result) {
+            if ($result['locale'] == 'all' && !$this->checkCachedRedirectsForEachLocale($url)) {
+                //There's a chance that it found an "all" but
+                //there's also at least one specific match still lurking...
+                //cache those as well, and if it turns out it's actually the
+                //redirect we wanted, use it instead.
+                $query = craft()->db->createCommand()
+                    ->select('*')
+                    ->from('retour_static_redirects')
+                    ->where('redirectSrcUrl = :url')
+                    ->andWhere('locale != "all"')
+                    ->bindValue(':url', $url);
+
+                foreach ($query->queryAll() as $specificRedirect) {
+                    $this->saveRedirectToCache($url . $specificRedirect['locale'], $specificRedirect);
+                    //Again, this can happen if a match was made prematurely
+                    if ($specificRedirect['locale'] == $this->getLocale()) {
+                        $error = $this->incrementRedirectHitCount($specificRedirect);
+                        RetourPlugin::log($specificRedirect['redirectMatchType'] . " result: " . print_r($error, true), LogLevel::Info, false);
+                        return $specificRedirect;
+                    }
+                }
+            }
+            $error = $this->incrementRedirectHitCount($result);
+            RetourPlugin::log($result['redirectMatchType'] . " result: " . print_r($error, true), LogLevel::Info, false);
+
             return $result;
         }
 
         return $result;
+    }
+
+    /**
+     * Check all locales for a cached redirect
+     * @param $url
+     * @return bool
+     */
+    private function checkCachedRedirectsForEachLocale($url) {
+        $foundRedirect = false;
+        foreach (craft()->i18n->getSiteLocaleIds() as $locale) {
+            if($this->getRedirectFromCache($url . $locale)) {
+                $foundRedirect = true;
+                break;
+            }
+        }
+        return $foundRedirect;
     }
 
     /**
@@ -191,10 +238,11 @@ class RetourService extends BaseApplicationComponent
     /**
      * @param  string $url       the url to match
      * @param  mixed  $redirects an array of redirects to look through
+     * @param  bool   $checkLocale ignore locale checking
      *
      * @return mixed      the redirect array
      */
-    public function lookupRedirect($url, $redirects)
+    public function lookupRedirect($url, $redirects, $checkLocale = false)
     {
         $result = null;
         foreach ($redirects as $redirect) {
@@ -203,9 +251,10 @@ class RetourService extends BaseApplicationComponent
                 // Do a straight up match
                 case "exactmatch":
                     if (strcasecmp($redirect['redirectSrcUrlParsed'], $url) === 0) {
-                        if (($this->shouldMatchLocale() && $this->getLocale() == $redirect['locale']) || !$this->shouldMatchLocale()) {
-                            $error = $this->incrementRedirectHitCount($redirect);
-                            RetourPlugin::log($redirectMatchType . " result: " . print_r($error, true), LogLevel::Info, false);
+                        if ($this->canLocaleMatch($checkLocale, $redirect)) {
+                            if($checkLocale) {
+                                $url = $url . $redirect['locale'];
+                            }
                             $this->saveRedirectToCache($url, $redirect);
                             return $redirect;
                         }
@@ -215,14 +264,16 @@ class RetourService extends BaseApplicationComponent
                 case "regexmatch":
                     $matchRegEx = "`" . $redirect['redirectSrcUrlParsed'] . "`i";
                     if (preg_match($matchRegEx, $url) === 1) {
-                        if (($this->shouldMatchLocale() && $this->getLocale() == $redirect['locale']) || !$this->shouldMatchLocale()) {
-                            $error = $this->incrementRedirectHitCount($redirect);
-                            RetourPlugin::log($redirectMatchType . " result: " . print_r($error, true), LogLevel::Info, false);
-
+                        if ($this->canLocaleMatch($checkLocale, $redirect)) {
                             // If we're not associated with an EntryID, handle capture group replacement
                             if ($redirect['associatedElementId'] == 0) {
                                 $redirect['redirectDestUrl'] = preg_replace($matchRegEx, $redirect['redirectDestUrl'], $url);
                             }
+
+                            if($checkLocale) {
+                                $url = $url . $redirect['locale'];
+                            }
+
                             $this->saveRedirectToCache($url, $redirect);
 
                             return $redirect;
@@ -253,6 +304,7 @@ class RetourService extends BaseApplicationComponent
                     break;
             }
         }
+
         RetourPlugin::log("Not handled: " . $url, LogLevel::Info, false);
 
         return $result;
@@ -584,19 +636,32 @@ class RetourService extends BaseApplicationComponent
     }
 
     /**
-     * @return  Whether locale should be compared against
+     * @return  bool
      */
     function shouldMatchLocale()
     {
         return defined("CRAFT_LOCALE");
-    } /* -- shouldMatchLocale */
+    }
 
     /**
-     * @return  Get locale
+     * @return  string
      */
     function getLocale()
     {
         return CRAFT_LOCALE;
-    } /* -- getLocale */
+    }
+
+    /**
+     * @param bool $checkLocale
+     * @param array $redirect
+     * @return bool
+     */
+    function canLocaleMatch($checkLocale, $redirect) {
+        return !$checkLocale ||
+            ($redirect['locale'] == 'all' ||
+                ($this->shouldMatchLocale() &&
+                $this->getLocale() == $redirect['locale'])
+            || !$this->shouldMatchLocale());
+    }
 
 }
