@@ -123,10 +123,9 @@
                     value: values.redirectHttpCode,
                 }) }}
             </div>
-            
             {% set locales = craft.i18n.getSiteLocales %}
             {% if locales|length %}
-            {% set localeOptions = {} %}
+            {% set localeOptions = {"all":"All"} %}
             {% for locale in locales %}
                 {% set localeId = locale.id %}
                 {% set localeName = locale.name %}
@@ -146,6 +145,7 @@
                     value: values.locale,
                 }) }}
             </div>
+
             {% endif %}
 
 <!-- Needed for for Craft < 2.5 -->
